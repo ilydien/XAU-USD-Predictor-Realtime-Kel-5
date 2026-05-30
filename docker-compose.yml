@@ -91,5 +91,32 @@ services:
       - postgres
       - dragonfly
 
+  prefect-server:
+    image: prefecthq/prefect:3-latest
+    command: prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_UI_URL: http://localhost:4200
+      PREFECT_API_URL: http://prefect-server:4200/api
+
+  prefect-worker:
+    build: .
+    command: >
+      sh -c "
+        prefect work-pool create --type process default 2>/dev/null;
+        prefect worker start --pool default --type process
+      "
+    volumes:
+      - model_storage:/app/models
+      - ./ml_pipeline:/app/ml_pipeline
+    depends_on:
+      - prefect-server
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      POSTGRES_DSN: postgresql://gold:gold@postgres:5432/golddb
+    restart: unless-stopped
+
 volumes:
   model_storage:
