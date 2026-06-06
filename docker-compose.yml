@@ -24,6 +24,11 @@ services:
       POSTGRES_DB: golddb
     volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gold -d golddb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   dragonfly:
     image: docker.io/dragonflydb/dragonfly:v1.27.1
@@ -86,11 +91,13 @@ services:
     ports:
       - "4200:4200"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
       PREFECT_UI_URL: http://localhost:4200
-      PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_API_URL: http://localhost:4200/api
       PREFECT_ORM_DATABASE_CONNECTION_URL: postgresql+asyncpg://gold:gold@postgres:5432/golddb
+    restart: unless-stopped
 
   prefect-worker:
     build: .
@@ -113,7 +120,7 @@ services:
 
   training-flow:
     build: .
-    command: python /app/ml_pipeline/training_flow.py
+    command: python -u /app/ml_pipeline/training_flow.py
     volumes:
       - model_storage:/app/models
       - ./ml_pipeline:/app/ml_pipeline
