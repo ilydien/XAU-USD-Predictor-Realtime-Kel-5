@@ -81,12 +81,16 @@ services:
 
   prefect-server:
     image: prefecthq/prefect:3-latest
+    platform: linux/amd64
     command: prefect server start --host 0.0.0.0
     ports:
       - "4200:4200"
+    depends_on:
+      - postgres
     environment:
       PREFECT_UI_URL: http://localhost:4200
       PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_ORM_DATABASE_CONNECTION_URL: postgresql+asyncpg://gold:gold@postgres:5432/golddb
 
   prefect-worker:
     build: .
