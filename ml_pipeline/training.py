@@ -8,6 +8,11 @@ import redis
 from datetime import datetime, timezone
 from kafka import KafkaProducer
 from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score, GridSearchCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 
 TICKERS = ["DX-Y.NYB", "EURUSD=X", "USDJPY=X", "GBPUSD=X", "^VIX", "^GSPC"]
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -44,9 +49,17 @@ def extract_ticker(df, ticker):
         return None
 
 
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
 print("[training] Fetching daily data...")
 df = yf.download(
-    TICKERS, period="5d", interval="1d", group_by="ticker", progress=False
+    TICKERS, period="2y", interval="1d", group_by="ticker", progress=False
 )
 
 ticker_data = {}
@@ -86,8 +99,6 @@ else:
     combined = new_df.sort_index()
     print("[training] No saved training data, starting fresh")
 
-if len(combined) > 100:
-    combined = combined.iloc[-100:]
 
 LAG_COLS = [
     "eur_close", "jpy_close", "gbp_close",
@@ -101,9 +112,22 @@ for col in LAG_COLS:
 
 combined["dxy_volatility_lag1"] = combined["dxy_volatility"].shift(1)
 
+for prefix in ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]:
+    combined[f"{prefix}_return"] = combined[f"{prefix}_close"].pct_change()
+
+combined["dxy_ma5"] = combined["dxy_close"].rolling(5).mean()
+combined["dxy_ma10"] = combined["dxy_close"].rolling(10).mean()
+combined["dxy_rsi"] = compute_rsi(combined["dxy_close"])
+
+TECH_COLS = (
+    [f"{p}_return" for p in ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]]
+    + ["dxy_ma5", "dxy_ma10", "dxy_rsi"]
+)
+
 FEATURE_COLS = (
     [f"{c}_lag{i}" for c in LAG_COLS for i in range(1, 4)]
     + ["dxy_volatility_lag1"]
+    + TECH_COLS
 )
 
 train_data = combined.dropna()
@@ -111,14 +135,54 @@ train_data = combined.dropna()
 if len(train_data) >= 3:
     X_cols = [c for c in FEATURE_COLS if c in train_data.columns]
     X = train_data[X_cols].values
-    y = train_data["dxy_volatility"].values
+    y = np.log1p(train_data["dxy_volatility"].values)
 
-    model = Ridge(alpha=1.0)
-    model.fit(X, y)
+    tscv = TimeSeriesSplit(n_splits=min(3, len(train_data) // 2))
+
+    ridge_pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", Ridge()),
+    ])
+    ridge_grid = {"model__alpha": [0.01, 0.1, 1, 10, 100, 1000]}
+    gs = GridSearchCV(ridge_pipeline, ridge_grid, cv=tscv, scoring="r2")
+    gs.fit(X, y)
+    ridge_model = gs.best_estimator_
+
+    ridge_cv_r2 = gs.best_score_
+    ridge_pred = ridge_model.predict(X)
+    ridge_r2 = r2_score(y, ridge_pred)
+    ridge_mae = mean_absolute_error(y, ridge_pred)
+    print(f"[training] Ridge (alpha={gs.best_params_['model__alpha']}) — In-sample R²: {ridge_r2:.4f} | CV R²: {ridge_cv_r2:.4f} | MAE: {ridge_mae:.4f}")
+
+    rf_pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", RandomForestRegressor(random_state=42)),
+    ])
+    rf_grid = {
+        "model__n_estimators": [50, 100, 200],
+        "model__max_depth": [None, 10, 20],
+        "model__min_samples_split": [2, 5, 10],
+    }
+    rf_gs = GridSearchCV(rf_pipeline, rf_grid, cv=tscv, scoring="r2", n_jobs=1)
+    rf_gs.fit(X, y)
+    rf_model = rf_gs.best_estimator_
+    rf_cv_r2 = rf_gs.best_score_
+    rf_pred = rf_model.predict(X)
+    rf_r2 = r2_score(y, rf_pred)
+    rf_mae = mean_absolute_error(y, rf_pred)
+    print(f"[training] RandomForest {rf_gs.best_params_} — In-sample R²: {rf_r2:.4f} | CV R²: {rf_cv_r2:.4f} | MAE: {rf_mae:.4f}")
+
+    if ridge_cv_r2 >= rf_cv_r2:
+        model = ridge_model
+        print(f"[training] Using Ridge (CV R²={ridge_cv_r2:.4f})")
+    else:
+        model = rf_model
+        print(f"[training] Using RandomForest (CV R²={rf_cv_r2:.4f})")
+
     joblib.dump(model, MODEL_PATH)
     joblib.dump(combined, DATA_PATH)
 
-    print(f"[training] Model trained on {len(train_data)} rows")
+    print(f"[training] Model saved: {type(model).__name__} trained on {len(train_data)} rows")
 else:
     print(f"[training] Insufficient data ({len(train_data)} rows), loading existing model")
     if os.path.exists(MODEL_PATH):
@@ -130,6 +194,10 @@ else:
 latest = combined.iloc[-1:].copy()
 if "dxy_volatility_lag1" not in latest.columns:
     latest["dxy_volatility_lag1"] = combined["dxy_volatility"].iloc[-2] if len(combined) >= 2 else 0
+
+for col in TECH_COLS:
+    if col not in latest.columns:
+        latest[col] = float(combined[col].iloc[-1]) if col in combined.columns else 0
 
 for col in LAG_COLS:
     for i in range(1, 4):
@@ -144,7 +212,7 @@ for col in LAG_COLS:
 if model is not None:
     pred_X = latest[[c for c in FEATURE_COLS if c in latest.columns]].values
     if not np.any(np.isnan(pred_X)):
-        predicted_vol = float(model.predict(pred_X)[0])
+        predicted_vol = float(np.expm1(model.predict(pred_X)[0]))
     else:
         predicted_vol = float(latest["dxy_volatility"].iloc[0]) if "dxy_volatility" in latest.columns else 0
 else:
