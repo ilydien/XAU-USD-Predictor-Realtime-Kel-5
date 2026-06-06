@@ -10,7 +10,7 @@ DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
 
 consumer = KafkaConsumer(
-    "gold-predictions",
+    "dxy-predictions",
     bootstrap_servers=KAFKA_BOOTSTRAP,
     value_deserializer=lambda v: json.loads(v.decode()),
     group_id="sink-group",
@@ -32,20 +32,32 @@ def get_db():
 
 conn, cur = get_db()
 
-print("[sink] Waiting for predictions...")
+print("[sink] Waiting for predictions on 'dxy-predictions'...")
 for msg in consumer:
     try:
         body = msg.value
 
-        r.set("latest:prediction:close", body["predicted_close"])
-        r.set("latest:prediction:timestamp", body["timestamp"])
+        predicted = body.get("predicted_volatility")
+        actual = body.get("actual_volatility")
+        ts = body.get("timestamp")
+        dxy_close = body.get("dxy_close")
+        source = body.get("source", "unknown")
+
+        if predicted is None:
+            continue
+
+        r.set("latest:dxy:predicted_volatility", predicted)
+        r.set("latest:dxy:predicted_timestamp", ts)
+        r.set("latest:dxy:close", dxy_close)
 
         r.xadd(
-            "gold-predictions",
+            "dxy-predictions",
             {
-                "timestamp": body["timestamp"],
-                "actual_close": body["actual_close"],
-                "predicted_close": body["predicted_close"],
+                "timestamp": ts,
+                "dxy_close": dxy_close,
+                "predicted_volatility": predicted,
+                "actual_volatility": actual if actual is not None else "",
+                "source": source,
             },
             maxlen=10000,
         )
@@ -56,17 +68,15 @@ for msg in consumer:
             VALUES (%s, %s, %s, %s)
         """,
             (
-                body["timestamp"],
-                body["predicted_close"],
-                body["actual_close"],
+                ts,
+                predicted,
+                actual if actual is not None else None,
                 json.dumps(body.get("features", {})),
             ),
         )
         conn.commit()
 
-        print(
-            f"[sink] Predicted={body['predicted_close']:.2f} Actual={body['actual_close']:.2f}"
-        )
+        print(f"[sink] source={source} pred_vol={predicted:.4f} actual_vol={actual}")
 
     except Exception as e:
         print(f"[sink] Error: {e}")

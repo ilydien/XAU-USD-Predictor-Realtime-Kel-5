@@ -1,12 +1,11 @@
 import json
 import os
-import threading
 from datetime import datetime, timezone
 from kafka import KafkaProducer
 import yfinance as yf
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-WS_TICKERS = os.getenv("WS_TICKERS", "XAUUSD=X").split(",")
+WS_TICKERS = os.getenv("WS_TICKERS", "DX-Y.NYB").split(",")
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -35,7 +34,7 @@ def handler(msg):
 
 print(f"[ws_listener] Connecting to WebSocket, tickers={WS_TICKERS}")
 
-# Listen blocks forever, so we run it in a thread with reconnect
+
 def listen_forever():
     while True:
         try:
@@ -45,6 +44,7 @@ def listen_forever():
         except Exception as e:
             print(f"[ws_listener] Disconnected: {e}, reconnecting in 5s...")
             import time
+
             time.sleep(5)
 
 

@@ -28,21 +28,6 @@ services:
   dragonfly:
     image: docker.dragonflydb.io/dragonfly/dragonfly:v1.26.3
 
-  ingestor:
-    build: .
-    command: python /app/ingestors/ingestor.py
-    depends_on:
-      - kafka
-      - dragonfly
-      - postgres
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      DRAGONFLY_HOST: dragonfly
-      POSTGRES_DSN: postgresql://gold:gold@postgres:5432/golddb
-      FETCH_INTERVAL: "60"
-      TICKERS: "XAUUSD=X,DX-Y.NYB,^VIX,^GSPC,CL=F"
-    restart: unless-stopped
-
   ws_listener:
     build: .
     command: python /app/ingestors/ws_listener.py
@@ -50,7 +35,7 @@ services:
       - kafka
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      WS_TICKERS: "XAUUSD=X"
+      WS_TICKERS: "DX-Y.NYB"
     restart: unless-stopped
 
   predictor:
@@ -58,8 +43,11 @@ services:
     command: python /app/ml_pipeline/predictor.py
     depends_on:
       - kafka
+      - dragonfly
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DRAGONFLY_HOST: dragonfly
+      MODEL_PATH: /app/models/dxy_model.pkl
     volumes:
       - model_storage:/app/models
     restart: unless-stopped
@@ -115,7 +103,26 @@ services:
     environment:
       PREFECT_API_URL: http://prefect-server:4200/api
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DRAGONFLY_HOST: dragonfly
       POSTGRES_DSN: postgresql://gold:gold@postgres:5432/golddb
+    restart: unless-stopped
+
+  training-flow:
+    build: .
+    command: python /app/ml_pipeline/training_flow.py
+    volumes:
+      - model_storage:/app/models
+      - ./ml_pipeline:/app/ml_pipeline
+    depends_on:
+      - prefect-server
+      - kafka
+      - dragonfly
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DRAGONFLY_HOST: dragonfly
+      MODEL_PATH: /app/models/dxy_model.pkl
+      DATA_PATH: /app/models/training_data.pkl
     restart: unless-stopped
 
 volumes:

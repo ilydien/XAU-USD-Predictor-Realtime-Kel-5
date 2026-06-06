@@ -4,15 +4,11 @@ import json
 from datetime import datetime, timezone
 from kafka import KafkaProducer
 import redis
-import psycopg2
-import time
 import os
 
-TICKERS = os.getenv("TICKERS", "XAUUSD=X,DX-Y.NYB,^VIX,^GSPC,CL=F").split(",")
+TICKERS = os.getenv("TICKERS", "DX-Y.NYB,EURUSD=X,USDJPY=X,GBPUSD=X,^VIX,^GSPC").split(",")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
-POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
-FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL", "60"))
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -23,24 +19,11 @@ producer = KafkaProducer(
 r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
 
 
-def get_db():
-    while True:
-        try:
-            conn = psycopg2.connect(POSTGRES_DSN)
-            return conn, conn.cursor()
-        except Exception as e:
-            print(f"[ingestor] Waiting for PostgreSQL: {e}")
-            time.sleep(3)
-
-
-conn, cur = get_db()
-
-
 def fetch_and_publish():
     df = yf.download(
         TICKERS,
-        period="1d",
-        interval="1m",
+        period="5d",
+        interval="1d",
         group_by="ticker",
         progress=False,
         auto_adjust=True,
@@ -70,52 +53,41 @@ def fetch_and_publish():
         except (KeyError, IndexError, ValueError, TypeError):
             continue
 
-    if not data or "XAUUSD=X" not in data:
-        print(f"[ingestor] No gold data at {timestamp}")
+    if not data or "DX-Y.NYB" not in data:
+        print(f"[ingestor] No DXY data at {timestamp}")
         return
 
     message = {"timestamp": timestamp.isoformat(), "data": data}
 
     producer.send("market-data", value=message)
-    print(f"[ingestor] Kafka: gold={data['XAUUSD=X']['close']}")
+    print(f"[ingestor] Kafka: DXY={data['DX-Y.NYB']['close']}")
 
     stream_entry = {"timestamp": timestamp.isoformat()}
     for ticker, ticker_data in data.items():
         stream_entry[ticker] = json.dumps(ticker_data)
     r.xadd("market-data", stream_entry, maxlen=10000)
 
-    r.set("latest:gold:close", data["XAUUSD=X"]["close"])
-    r.set("latest:gold:timestamp", timestamp.isoformat())
-    if "DX-Y.NYB" in data:
-        r.set("latest:dxy:close", data["DX-Y.NYB"]["close"])
+    r.set("latest:dxy:close", data["DX-Y.NYB"]["close"])
+    r.set("latest:dxy:high", data["DX-Y.NYB"]["high"])
+    r.set("latest:dxy:low", data["DX-Y.NYB"]["low"])
+    r.set("latest:dxy:timestamp", timestamp.isoformat())
+
+    if "EURUSD=X" in data:
+        r.set("latest:eur:close", data["EURUSD=X"]["close"])
+    if "USDJPY=X" in data:
+        r.set("latest:jpy:close", data["USDJPY=X"]["close"])
+    if "GBPUSD=X" in data:
+        r.set("latest:gbp:close", data["GBPUSD=X"]["close"])
     if "^VIX" in data:
         r.set("latest:vix:close", data["^VIX"]["close"])
+    if "^GSPC" in data:
+        r.set("latest:sp500:close", data["^GSPC"]["close"])
 
-    for ticker, ticker_data in data.items():
-        cur.execute(
-            """
-            INSERT INTO market_data (timestamp, ticker, open, high, low, close, volume)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-        """,
-            (
-                timestamp,
-                ticker,
-                ticker_data["open"],
-                ticker_data["high"],
-                ticker_data["low"],
-                ticker_data["close"],
-                ticker_data["volume"],
-            ),
-        )
-    conn.commit()
-    print(f"[ingestor] PostgreSQL: inserted {len(data)} tickers")
+    vol = data["DX-Y.NYB"]["high"] - data["DX-Y.NYB"]["low"]
+    r.set("latest:dxy:volatility", vol)
+
+    return message
 
 
-while True:
-    try:
-        fetch_and_publish()
-    except Exception as e:
-        print(f"[ingestor] Error: {e}")
-        time.sleep(5)
-    time.sleep(FETCH_INTERVAL)
+if __name__ == "__main__":
+    fetch_and_publish()

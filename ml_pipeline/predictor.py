@@ -3,11 +3,12 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-from collections import deque
 from kafka import KafkaConsumer, KafkaProducer
+import redis
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-MODEL_PATH = "/app/models/gold_model.pkl"
+DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -19,76 +20,87 @@ consumer = KafkaConsumer(
     "market-data",
     bootstrap_servers=KAFKA_BOOTSTRAP,
     value_deserializer=lambda v: json.loads(v.decode()),
-    group_id="predictor-group",
+    group_id="predictor-stream-group",
     auto_offset_reset="latest",
 )
 
-model = None
-gold_history = deque(maxlen=10)
+r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
 
+model = None
 if os.path.exists(MODEL_PATH):
     model = joblib.load(MODEL_PATH)
     print(f"[predictor] Loaded model from {MODEL_PATH}")
 else:
-    print("[predictor] No model found, using heuristic (price ~= last close)")
+    print("[predictor] No model found, using heuristic")
+
+CACHE_KEYS = [
+    "latest:eur:close", "latest:jpy:close", "latest:gbp:close",
+    "latest:vix:close", "latest:sp500:close", "latest:dxy:close",
+    "latest:dxy:high", "latest:dxy:low", "latest:dxy:volatility",
+]
 
 
-def prepare_features(msg_data):
-    gold = msg_data.get("XAUUSD=X", {})
-    gold_close = gold.get("close", 0)
-    gold_history.append(gold_close)
-
-    closes = list(gold_history)
-    while len(closes) < 5:
-        closes = [closes[0]] + closes if closes else [gold_close]
-
-    features = {
-        "gold_lag1": closes[-1],
-        "gold_lag2": closes[-2] if len(closes) >= 2 else closes[-1],
-        "gold_lag3": closes[-3] if len(closes) >= 3 else closes[-1],
-        "gold_lag4": closes[-4] if len(closes) >= 4 else closes[-1],
-        "gold_lag5": closes[-5] if len(closes) >= 5 else closes[-1],
-        "gold_ma5": np.mean(closes[-5:]),
-        "dxy_close": msg_data.get("DX-Y.NYB", {}).get("close", 0),
-        "vix_close": msg_data.get("^VIX", {}).get("close", 0),
-        "sp500_close": msg_data.get("^GSPC", {}).get("close", 0),
-        "oil_close": msg_data.get("CL=F", {}).get("close", 0),
-    }
-
-    return features, gold_close
+def read_cache():
+    vals = r.mget(CACHE_KEYS)
+    out = {}
+    for key, val in zip(CACHE_KEYS, vals):
+        name = key.replace("latest:", "").replace(":", "_")
+        out[name] = float(val) if val else None
+    return out
 
 
-def predict(features, gold_close):
-    if model is not None:
-        df = pd.DataFrame([features])
-        predicted = float(model.predict(df)[0])
-    else:
-        predicted = gold_close
-
-    return predicted
+FEATURE_COLS = (
+    [f"{c}_lag{i}" for c in ["eur_close", "jpy_close", "gbp_close", "vix_close", "sp500_close", "dxy_close"] for i in range(1, 4)]
+    + ["dxy_volatility_lag1"]
+)
 
 
-print("[predictor] Waiting for market data...")
+def build_features(dxy_close, cache):
+    features = {}
+    for prefix in ["eur", "jpy", "gbp", "vix", "sp500"]:
+        features[f"{prefix}_close"] = cache.get(f"{prefix}_close", 0)
+    features["dxy_close"] = dxy_close
+    for col in ["eur_close", "jpy_close", "gbp_close", "vix_close", "sp500_close", "dxy_close"]:
+        for i in range(1, 4):
+            features[f"{col}_lag{i}"] = features.get(col, 0)
+    features["dxy_volatility_lag1"] = cache.get("dxy_volatility", 0)
+    return features
+
+
+print("[predictor] Waiting for streaming market data...")
 for msg in consumer:
     try:
         body = msg.value
         data = body.get("data", {})
 
-        if "XAUUSD=X" not in data:
+        dxy_data = data.get("DX-Y.NYB", {})
+        if not dxy_data:
             continue
 
-        features, gold_close = prepare_features(data)
-        predicted = predict(features, gold_close)
+        dxy_close = float(dxy_data.get("close", 0))
+        cache = read_cache()
+
+        features = build_features(dxy_close, cache)
+
+        if model is not None:
+            df_feat = pd.DataFrame([{k: features.get(k, 0) for k in FEATURE_COLS}])
+            predicted_vol = float(model.predict(df_feat)[0])
+        else:
+            predicted_vol = cache.get("dxy_volatility", 0)
+
+        predicted_vol = max(predicted_vol, 0)
 
         result = {
             "timestamp": body.get("timestamp"),
-            "actual_close": gold_close,
-            "predicted_close": round(predicted, 2),
-            "features": features,
+            "dxy_close": round(dxy_close, 4),
+            "predicted_volatility": round(predicted_vol, 4),
+            "actual_volatility": None,
+            "source": "stream",
+            "features": {k: round(v, 4) if isinstance(v, float) else v for k, v in features.items()},
         }
 
-        producer.send("gold-predictions", value=result)
-        print(f"[predictor] actual={gold_close:.2f} predicted={predicted:.2f}")
+        producer.send("dxy-predictions", value=result)
+        print(f"[predictor] DXY={dxy_close:.4f} pred_vol={predicted_vol:.4f}")
 
     except Exception as e:
         print(f"[predictor] Error: {e}")
